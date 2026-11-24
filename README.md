@@ -5,7 +5,7 @@ A single-file Python example that calls the Claude API **without a static API ke
 A workload (a script, container or CI job) proves its identity to Okta with a private key. Okta returns a short-lived access token. Anthropic exchanges that token for an ephemeral Anthropic access token, which is then used to call Claude.
 
 ```
-workload --(1) signed client assertion (private_key_jwt)--> Okta
+workload --(1) signed client assertion (private_key_jwt)--> Okta custom authorization server
          <------------(2) Okta access token----------------
          --(3) Okta token + federation rule IDs-----------> Anthropic /v1/oauth/token
          <------------(4) short-lived Anthropic token------
@@ -18,35 +18,31 @@ workload --(1) signed client assertion (private_key_jwt)--> Okta
 - **Short-lived credentials.** The Okta client assertion lasts 5 minutes, and the Anthropic token expires on its own.
 - **Central control.** Access is granted and revoked in Okta and in the Anthropic federation rule, not by rotating keys.
 
+## How the flow works
+
+| # | From → To | What happens |
+|---|---|---|
+| 1 | Workload (local) | Signs a short-lived JWT (the client assertion) with `workload_private_key.pem`. |
+| 2 | Workload → Okta `/oauth2/<server_id>/v1/token` | Sends a `client_credentials` grant with `client_assertion_type=urn:ietf:params:oauth:client-assertion-type:jwt-bearer`. Okta verifies the signature against the app's registered public key and returns an access token for the `anthropic.access` scope. |
+| 3 | Workload → Anthropic `/v1/oauth/token` | Sends the Okta token as a `urn:ietf:params:oauth:grant-type:jwt-bearer` assertion, with the federation rule, organization and service account IDs. |
+| 4 | Anthropic (internal) | Fetches Okta's public keys through OIDC discovery, verifies the token's signature and claims against the federation rule, and returns a short-lived token for the service account. |
+| 5 | Workload → Claude `/v1/messages` | Calls Claude with `Authorization: Bearer <anthropic token>`. |
+
+## Before you start: two things that trip people up
+
+**You need the Claude Developer Platform, not a Claude Pro subscription.** Claude Pro (claude.ai) is the chat product for people. Service accounts, workload identity and API billing live in the Anthropic Console at [platform.claude.com](https://platform.claude.com).
+
+**You need an Okta custom authorization server, not the org authorization server.** The org authorization server (`https://<org>.okta.com`) issues tokens meant for Okta's own APIs: you can't set their audience, scopes or access policies. A custom authorization server (`https://<org>.okta.com/oauth2/<server_id>`) issues tokens for an external API such as Anthropic, with a custom audience, scopes and policies. Custom authorization servers come with Okta API Access Management, which Okta developer tenants include.
+
 ## Prerequisites
 
+- An Okta tenant with API Access Management (a developer edition tenant works)
+- An Anthropic organization on [platform.claude.com](https://platform.claude.com) with permission to manage workload identity. The final Claude call needs API credits; the token exchange works without them.
 - Python 3.9+
-- An Okta org where you can create apps and custom authorization servers
-- An Anthropic organization with permission to create service accounts and federation rules
 
-## 1. Configure Okta
+## Setup
 
-1. **Create an API Services app** (Applications → Create App Integration → *API Services*).
-   - Client authentication: **Public key / Private key**.
-   - Add a public key for the app. You can create the key pair in Okta or yourself; see [Step 2: create `workload_private_key.pem`](#3-run-it).
-   - Note the **Client ID**.
-2. **Use a custom authorization server** (Security → API → Authorization Servers). You can use `default` or create a new one, and note its **ID**.
-   - Add a custom scope, for example `anthropic.access`.
-   - Add an access policy and rule that allow the *Client Credentials* grant for your app and that scope.
-   - Note the **Issuer URI**; you need it on the Anthropic side.
-
-## 2. Configure Anthropic
-
-In the Anthropic Console, under your organization's settings:
-
-1. Create a **service account** for the workload.
-2. Add Okta as a **federation issuer** using the authorization server's Issuer URI.
-3. Create a **federation rule** that maps Okta tokens (for example, matching the `sub`/`cid` claim to your Okta client ID and the expected audience) to that service account and the workspace(s) it may use.
-4. Note the **federation rule ID**, **organization ID**, **service account ID** and, if needed, the **workspace ID**.
-
-## 3. Run it
-
-**Step 1: clone the repo and install the dependencies**
+### Step 1: clone the repo and install the dependencies
 
 ```bash
 git clone https://github.com/IAM-FSantos/okta_to_anthropic_wif.git
@@ -57,20 +53,13 @@ python -m venv .venv
 pip install -r requirements.txt
 ```
 
-**Step 2: create `workload_private_key.pem`**
+### Step 2: create the key pair
 
-The script signs its Okta login with this RSA private key. Okta must hold the matching public key. Use either option below.
+The workload signs its Okta login with an RSA private key, and Okta verifies it with the matching public key. Use either option.
 
-*Option A: let Okta generate the key pair*
+**Option A (recommended): generate the key pair yourself.** The private key is created where it will be used and never passes through a browser.
 
-1. In the Okta app, go to **General → Client Credentials → Public Keys → Add key → Generate new key**.
-2. Select the **PEM** tab and copy the private key. Okta shows it only once.
-3. Save it in the project folder as `workload_private_key.pem`, including the `-----BEGIN PRIVATE KEY-----` and `-----END PRIVATE KEY-----` lines.
-4. Save the key in Okta, then copy its **Key ID (kid)** into `OKTA_KEY_ID`.
-
-*Option B: generate the key pair yourself*
-
-This script also needs `joserfc`, which isn't in `requirements.txt` because only key generation uses it:
+The script also needs `joserfc`, which isn't in `requirements.txt` because only key generation uses it:
 
 ```bash
 pip install joserfc
@@ -105,22 +94,51 @@ print("\n--- PUBLIC JWK (paste into Okta) ---")
 print(json.dumps(key.as_dict(private=False), indent=2))
 ```
 
-It writes a 4096-bit private key to `workload_private_key.pem` and prints only the **public** key as a JWK. In the Okta app, go to **Public Keys → Add key**, paste the JWK and save. Then set `OKTA_KEY_ID` to the same `kid`.
+It writes a 4096-bit private key to `workload_private_key.pem` and prints only the **public** key as a JWK. Copy the JWK; you'll paste it into Okta in step 3.
 
-Whichever option you use:
+**Option B: let Okta generate the key pair.** While setting up the app in step 3, choose **Generate new key** instead of pasting a JWK. Okta displays the private key only once: copy it in PEM format and save it in the project folder as `workload_private_key.pem`, including the `BEGIN` and `END` lines. Use the key ID Okta shows as `OKTA_KEY_ID`.
+
+Either way:
 
 - Never share or commit the private key. `.gitignore` already excludes `*.pem` files.
 - To keep the key elsewhere, set `OKTA_PRIVATE_KEY_PATH` to its path.
 
-**Step 3: configure `.env`**
+### Step 3: configure Okta
+
+In the Okta Admin Console:
+
+1. **Create the app.** Go to **Applications → Applications → Create App Integration → API Services**. Name it (for example `Claude-Anthropic-Workload`) and note the **Client ID** (`0oa...`).
+2. **Add the public key.** Under **Keys and certificate**, click **Edit → Add key**. Paste the JWK from step 2 (or choose **Generate new key** for option B), click **Done**, then **Save**.
+3. **Switch to key-based authentication.** Under **Client Credentials**, click **Edit**, change client authentication from **Client secret** to **Public key / Private key** (JWT assertion), and save.
+4. **Turn off proof of possession.** Under **General Settings**, make sure **Require Demonstrating Proof of Possession (DPoP)** is not enabled. This script doesn't send DPoP proofs.
+5. **Create the authorization server.** Go to **Security → API → Authorization Servers → Add Authorization Server**. Name it (for example `Anthropic API`) and set the audience to `https://api.anthropic.com`. Note its **ID** (`aus...`) and **Issuer URI**.
+6. **Add the scope.** On that server's **Scopes** tab, add a scope named `anthropic.access`.
+7. **Allow the app to request it.** On the **Access Policies** tab, create a policy assigned to your app, with a rule that allows the **Client Credentials** grant and the `anthropic.access` scope.
+
+### Step 4: configure Anthropic
+
+In the Anthropic Console ([platform.claude.com](https://platform.claude.com)), go to **Organization → Keys → Workload identity → Connect workload → New provider → Custom OIDC**. The wizard registers the issuer, creates a service account and creates a federation rule.
+
+1. **Issuer**
+   - **Issuer URL:** the Issuer URI of your Okta authorization server, for example `https://<org>.okta.com/oauth2/aus...`
+   - **JWKS source:** OIDC discovery, with the issuer's discovery document and JWKS reachable from the public internet
+2. **Federation rule**
+   - **Subject (`sub`) claim:** your Okta **Client ID**. For a client credentials grant, Okta sets `sub` to the client ID.
+   - **Workspaces:** the workspaces the workload may use. If you choose more than one, or all workspaces, you must set `ANTHROPIC_WORKSPACE_ID` in `.env`.
+   - If you added custom claims in Okta, you can match those instead, using the claims map or a CEL condition.
+3. **Service account:** select or create a dedicated service account (`svac_...`) with only the access the workload needs.
+
+When you finish the wizard, note these IDs: the **federation rule ID** (`fdrl_...`), **organization ID** (a UUID), **service account ID** (`svac_...`) and **workspace ID** (`wrkspc_...`).
+
+### Step 5: configure `.env`
 
 ```bash
 cp .env.example .env    # Windows (cmd): copy .env.example .env
 ```
 
-Open `.env` and fill in the IDs from the Okta and Anthropic setup above.
+Open `.env` and fill in the values from steps 2 to 4. Every setting is described under [Configuration](#configuration).
 
-**Step 4: run it**
+### Step 6: run it
 
 ```bash
 python main.py
@@ -141,20 +159,27 @@ Token lifetime: 600 seconds.
 Response: ...
 ```
 
+## Verify and audit
+
+You can see each run in both consoles:
+
+- **Anthropic Console:** go to **Organization → Keys → Workload identity → Authentication events**. A successful exchange shows as **Success**, meaning the Okta signature, `sub` claim and audience matched your federation rule. Failed attempts show here too, which helps when debugging a `401`.
+- **Okta Admin Console:** go to **Reports → System Log** and filter by your app to see each token issuance.
+
 ## Configuration
 
 | Variable | Required | Description |
 |---|---|---|
 | `OKTA_DOMAIN` | yes | Okta org domain, without `https://` (e.g. `dev-123456.okta.com`) |
-| `OKTA_AUTH_SERVER_ID` | yes | Custom authorization server ID (or `default`) |
-| `OKTA_CLIENT_ID` | yes | Client ID of the API Services app |
-| `OKTA_KEY_ID` | yes | `kid` of the public key registered on the app |
+| `OKTA_AUTH_SERVER_ID` | yes | ID of the custom authorization server from step 3 (`aus...`) |
+| `OKTA_CLIENT_ID` | yes | Client ID of the API Services app from step 3 (`0oa...`) |
+| `OKTA_KEY_ID` | yes | `kid` of the public key from step 2 |
 | `OKTA_PRIVATE_KEY_PATH` | no | Path to the PEM private key (default `workload_private_key.pem`) |
 | `OKTA_SCOPE` | no | Scope to request (default `anthropic.access`) |
-| `ANTHROPIC_FEDERATION_RULE_ID` | yes | Federation rule ID |
-| `ANTHROPIC_ORGANIZATION_ID` | yes | Anthropic organization ID |
-| `ANTHROPIC_SERVICE_ACCOUNT_ID` | yes | Service account the rule maps to |
-| `ANTHROPIC_WORKSPACE_ID` | no | Required when the rule covers more than one workspace |
+| `ANTHROPIC_FEDERATION_RULE_ID` | yes | Federation rule ID (`fdrl_...`) |
+| `ANTHROPIC_ORGANIZATION_ID` | yes | Anthropic organization ID (UUID) |
+| `ANTHROPIC_SERVICE_ACCOUNT_ID` | yes | Service account the rule maps to (`svac_...`) |
+| `ANTHROPIC_WORKSPACE_ID` | no | Workspace ID (`wrkspc_...`); required when the rule covers more than one workspace |
 | `CLAUDE_MODEL` | no | Model for the test call (default `claude-opus-5-5`) |
 
 ## Troubleshooting
@@ -162,10 +187,11 @@ Response: ...
 | Error | Likely cause |
 |---|---|
 | `Algorithm 'RS256' could not be found` | `cryptography` isn't installed. Run `pip install -r requirements.txt`. |
-| Okta `invalid_client` | Wrong `OKTA_KEY_ID`, the private key doesn't match the registered public key, or the app isn't set to private_key_jwt. |
+| Okta `invalid_client` | Wrong `OKTA_KEY_ID`, the private key doesn't match the registered public key, or the app still uses a client secret. |
+| Okta `invalid_dpop_proof` or a DPoP error | Proof of possession is enabled on the app. Turn it off (step 3.4). |
 | Okta `invalid_scope` / `access_denied` | The scope doesn't exist on the authorization server, or no access policy rule allows the client credentials grant. |
+| Anthropic `401` on token exchange | The issuer, `sub` or audience in the Okta token doesn't match the federation rule, an ID is wrong, or `ANTHROPIC_WORKSPACE_ID` is missing for a multi-workspace rule. Check **Authentication events** in the Anthropic Console. |
 | Claude API `400` "credit balance is too low" | Federation worked; the organization needs API credits (Console → Plans & Billing). |
-| Anthropic `401` on token exchange | The issuer or claims in the Okta token don't match the federation rule, the IDs are wrong, or `ANTHROPIC_WORKSPACE_ID` is missing for a multi-workspace rule. |
 
 ## Using the official SDK in production
 
