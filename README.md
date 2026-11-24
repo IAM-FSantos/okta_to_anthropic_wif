@@ -1,15 +1,31 @@
 # Okta → Anthropic Workload Identity Federation (WIF)
 
-A single-file Python example that calls the Claude API **without a static API key**.
+Call the Claude API **without a static API key**, using Okta as the identity provider. This repo shows the same flow two ways:
+
+| | What it is | Start here |
+|---|---|---|
+| 🐍 **Python** | A single-file script (`main.py`) you can drop into a workload | [Setup](#setup) below |
+| 📮 **Postman** | A documented collection that runs each HTTP call one at a time, with scripts that decode tokens and explain errors | [`postman/`](postman/README.md) |
+
+Both use the same Okta and Anthropic configuration, so steps 3 and 4 of the [Setup](#setup) apply to either.
 
 A workload (a script, container or CI job) proves its identity to Okta with a private key. Okta returns a short-lived access token. Anthropic exchanges that token for an ephemeral Anthropic access token, which is then used to call Claude.
 
-```
-workload --(1) signed client assertion (private_key_jwt)--> Okta custom authorization server
-         <------------(2) Okta access token----------------
-         --(3) Okta token + federation rule IDs-----------> Anthropic /v1/oauth/token
-         <------------(4) short-lived Anthropic token------
-         --(5) Bearer token-------------------------------> Claude Messages API
+```mermaid
+sequenceDiagram
+    autonumber
+    participant W as Workload (main.py or Postman)
+    participant O as Okta custom authorization server
+    participant A as Anthropic /v1/oauth/token
+    participant C as Claude Messages API
+    W->>W: Sign client assertion (RS256, private key)
+    W->>O: POST /oauth2/{server_id}/v1/token<br/>client_credentials + client_assertion
+    O-->>W: Okta access token (JWT, aud = https://api.anthropic.com)
+    W->>A: POST jwt-bearer grant<br/>assertion + federation_rule_id + organization_id
+    A->>O: Fetch JWKS (OIDC discovery), verify signature and claims
+    A-->>W: Short-lived Anthropic token (sk-ant-oat01-...)
+    W->>C: POST /v1/messages<br/>Authorization: Bearer token
+    C-->>W: Claude's reply
 ```
 
 ## Why
@@ -202,6 +218,21 @@ This script calls the endpoints with `requests` so each step of the flow is visi
 - `.env` and `*.pem` files are in `.gitignore`. **Never commit your private key.** If one is ever pushed, revoke it in Okta immediately; deleting the commit isn't enough.
 - In real deployments, keep the private key in a secrets manager or KMS/HSM, not on disk.
 - Scope the federation rule tightly: one service account, the minimum set of workspaces, and exact claim matches.
+
+## Repository layout
+
+```
+.
+├── main.py                 # Python implementation of the full flow
+├── requirements.txt
+├── .env.example            # Template for the Python script's settings
+├── postman/
+│   ├── README.md                                          # Postman guide: setup, variables, scripts, troubleshooting
+│   ├── okta-to-anthropic-wif.postman_collection.json      # The collection (placeholders only)
+│   └── okta-to-anthropic-wif.postman_environment.example.json  # Environment template
+├── LICENSE
+└── README.md
+```
 
 ## License
 

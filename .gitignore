@@ -24,3 +24,8 @@ env/
 .vscode/
 .DS_Store
 Thumbs.db
+
+# Postman: real environment exports hold your IDs and private key
+*.postman_environment.json
+!*.postman_environment.example.json
+*.postman_globals.json
