@@ -28,7 +28,7 @@ workload --(1) signed client assertion (private_key_jwt)--> Okta
 
 1. **Create an API Services app** (Applications → Create App Integration → *API Services*).
    - Client authentication: **Public key / Private key**.
-   - Generate a key pair in Okta or upload your own public key. Save the private key as `workload_private_key.pem` and note its **Key ID (kid)**.
+   - Add a public key for the app. You can create the key pair in Okta or yourself; see [Step 2: create `workload_private_key.pem`](#3-run-it).
    - Note the **Client ID**.
 2. **Use a custom authorization server** (Security → API → Authorization Servers). You can use `default` or create a new one, and note its **ID**.
    - Add a custom scope, for example `anthropic.access`.
@@ -46,6 +46,8 @@ In the Anthropic Console, under your organization's settings:
 
 ## 3. Run it
 
+**Step 1: clone the repo and install the dependencies**
+
 ```bash
 git clone https://github.com/IAM-FSantos/okta_to_anthropic_wif.git
 cd okta_to_anthropic_wif
@@ -53,10 +55,74 @@ cd okta_to_anthropic_wif
 python -m venv .venv
 # Windows: .venv\Scripts\activate    macOS/Linux: source .venv/bin/activate
 pip install -r requirements.txt
+```
 
-cp .env.example .env    # then fill in your values
-# put your private key at ./workload_private_key.pem (or set OKTA_PRIVATE_KEY_PATH)
+**Step 2: create `workload_private_key.pem`**
 
+The script signs its Okta login with this RSA private key. Okta must hold the matching public key. Use either option below.
+
+*Option A: let Okta generate the key pair*
+
+1. In the Okta app, go to **General → Client Credentials → Public Keys → Add key → Generate new key**.
+2. Select the **PEM** tab and copy the private key. Okta shows it only once.
+3. Save it in the project folder as `workload_private_key.pem`, including the `-----BEGIN PRIVATE KEY-----` and `-----END PRIVATE KEY-----` lines.
+4. Save the key in Okta, then copy its **Key ID (kid)** into `OKTA_KEY_ID`.
+
+*Option B: generate the key pair yourself*
+
+This script also needs `joserfc`, which isn't in `requirements.txt` because only key generation uses it:
+
+```bash
+pip install joserfc
+```
+
+Save this as `generate_key.py` in the project folder, change `KID` to a name of your choice, and run `python generate_key.py`:
+
+```python
+import json
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
+from joserfc.jwk import RSAKey
+
+KID = "my-workload-key-01"  # Unique Key ID (kid); use the same value for OKTA_KEY_ID
+
+# 1. Generate an RSA key pair
+private_key = rsa.generate_private_key(public_exponent=65537, key_size=4096)
+
+# 2. Save the private key (PEM). Keep it secure on the workload; never commit it.
+private_pem = private_key.private_bytes(
+    encoding=serialization.Encoding.PEM,
+    format=serialization.PrivateFormat.TraditionalOpenSSL,
+    encryption_algorithm=serialization.NoEncryption(),
+).decode("utf-8")
+with open("workload_private_key.pem", "w") as f:
+    f.write(private_pem)
+
+# 3. Print the public key (JWK) to paste into Okta
+key = RSAKey.import_key(private_pem, parameters={"kid": KID, "use": "sig", "alg": "RS256"})
+print("Saved private key to workload_private_key.pem")
+print("\n--- PUBLIC JWK (paste into Okta) ---")
+print(json.dumps(key.as_dict(private=False), indent=2))
+```
+
+It writes a 4096-bit private key to `workload_private_key.pem` and prints only the **public** key as a JWK. In the Okta app, go to **Public Keys → Add key**, paste the JWK and save. Then set `OKTA_KEY_ID` to the same `kid`.
+
+Whichever option you use:
+
+- Never share or commit the private key. `.gitignore` already excludes `*.pem` files.
+- To keep the key elsewhere, set `OKTA_PRIVATE_KEY_PATH` to its path.
+
+**Step 3: configure `.env`**
+
+```bash
+cp .env.example .env    # Windows (cmd): copy .env.example .env
+```
+
+Open `.env` and fill in the IDs from the Okta and Anthropic setup above.
+
+**Step 4: run it**
+
+```bash
 python main.py
 ```
 
